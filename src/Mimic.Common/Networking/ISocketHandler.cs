@@ -2,10 +2,13 @@ using System;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 
-namespace Mimic.Common
+namespace Mimic.Common.Networking
 {
     public interface ISocketHandler
     {
-        Task RunAsync(TcpClient client);
+        Task RunAsync();
+
+        TcpClient Client { get; }
+        void SetClient(TcpClient client);
     }
 }

@@ -8,7 +8,8 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
-using Mimic.Common;
+using Microsoft.Extensions.Logging;
+using Mimic.Common.Networking;
 
 namespace Mimic.RealmServer
 {
@@ -17,28 +18,33 @@ namespace Mimic.RealmServer
         private const uint GameName = 0x00_57_6f_57; // 'WoW'
         private const string TestPassword = "PASSWORD"; // Password is uppercase
 
+        private readonly ILogger _logger;
+        private readonly SrpHandler _authentication;
+
         private bool _run = true;
         private TcpClient _client;
-        private Stream _clientStream;
         private AsyncBinaryReader _reader;
-        private SrpHandler _authentication = new SrpHandler();
+        private AuthWriter _writer;
 
         private ushort _buildNumber;
-
         private AuthCommand _currentCommand;
 
-        public async Task RunAsync(TcpClient client)
+        public TcpClient Client
+            => _client;
+
+        public AuthHandler(ILogger<AuthHandler> logger)
         {
-            _client = client;
-            _client.ReceiveTimeout = 1000;
+            _logger = logger;
+            _authentication = new SrpHandler();
+        }
 
-            _clientStream = _client.GetStream();
-            _reader = new AsyncBinaryReader(_clientStream);
-
+        public async Task RunAsync()
+        {
             while (_run)
             {
                 var cmd = (AuthCommand)await _reader.ReadUInt8Async();
                 _currentCommand = cmd;
+                _logger.LogTrace("Handling opcode {Opcode} from client", cmd);
                 switch (cmd)
                 {
                     case AuthCommand.LogonChallenge:
@@ -51,18 +57,27 @@ namespace Mimic.RealmServer
                         await HandleRealmListAsync();
                         break;
                     default:
-                        Debug.WriteLine($"Unhandled opcode {cmd} (0x{cmd:X})");
-                        await CloseAsync(AuthStatus.Unimplemented);
+                        _logger.LogDebug("Unhandled opcode {Opcode}", cmd);
+                        _run = false;
                         break;
                 }
             }
         }
 
+        public void SetClient(TcpClient client)
+        {
+            _client = client;
+            _client.ReceiveTimeout = 1000;
+
+            var stream = _client.GetStream();
+            _reader = new AsyncBinaryReader(stream);
+            _writer = new AuthWriter(stream);
+        }
+
         public void Dispose()
         {
             _reader?.Dispose();
-            _clientStream?.Dispose();
-            _client?.Dispose();
+            _writer?.Dispose();
         }
 
         private async Task HandleLogonChallengeAsync()
@@ -70,9 +85,9 @@ namespace Mimic.RealmServer
             var error = await _reader.ReadUInt8Async(); // always 3
             var size = await _reader.ReadUInt16Async();
 
-            if (_client.Available < size)
+            if (_reader.Available < size)
             {
-                await CloseAsync(AuthStatus.ProtocolError);
+                await _writer.FailChallengeAsync(AuthStatus.ProtocolError);
                 return;
             }
 
@@ -80,7 +95,7 @@ namespace Mimic.RealmServer
 
             if (gameName != GameName)
             {
-                await CloseAsync(AuthStatus.ProtocolError);
+                await _writer.FailChallengeAsync(AuthStatus.ProtocolError);
                 return;
             }
 
@@ -99,8 +114,8 @@ namespace Mimic.RealmServer
             var ipAddress = new IPAddress(await _reader.ReadUInt32Async());
             var realAddress = (_client.Client.RemoteEndPoint as IPEndPoint).Address;
 
-            var accountNameLength = await _reader.ReadUInt8Async();
-            var accountName = await _reader.ReadStringAsync(accountNameLength);
+            var accountName = await _reader
+                .ReadStringAsync(StringEncoding.LengthPrefixedUInt8);
             accountName = accountName.ToUpperInvariant();
 
             using (var sha = SHA1.Create())
@@ -112,28 +127,11 @@ namespace Mimic.RealmServer
                 _authentication.ComputePrivateFields(accountName, hash);
             }
 
-            List<byte> data = new List<byte>();
-
-            data.Add((byte)_currentCommand);
-            data.Add(0);
-
-            data.Add((byte)AuthStatus.Success);
-
-            data.AddRange(_authentication.PublicKey); // B
-
-            data.Add((byte)_authentication.Generator.Length);
-            data.AddRange(_authentication.Generator); // g
-
-            data.Add((byte)_authentication.SafePrime.Length);
-            data.AddRange(_authentication.SafePrime); // N
-
-            data.AddRange(_authentication.Salt); // s
-
-            data.AddRange(Enumerable.Repeat((byte)0, 16));
-
-            data.Add(0); // security flags;
-
-            await _clientStream.WriteAsync(data.ToArray(), 0, data.Count);
+            await _writer.PassChallengeAsync(
+                _authentication.PublicKey,
+                _authentication.Generator,
+                _authentication.SafePrime,
+                _authentication.Salt);
         }
 
         public async Task HandleLogonProofAsync()
@@ -144,26 +142,20 @@ namespace Mimic.RealmServer
             var keyCount = await _reader.ReadUInt8Async();
             var securityFlags = await _reader.ReadUInt8Async();
 
-            if (!_authentication.Authenticate(clientPublicKey, clientProof))
+            var authStatus = _authentication.Authenticate(
+                clientPublicKey.Span, clientProof.Span);
+
+            if (!authStatus)
             {
-                await SendErrorAsync(AuthStatus.IncorrectPassword);
+                await _writer.FailProofAsync(AuthStatus.IncorrectPassword);
                 return;
             }
 
-            var proof = _authentication.ComputeProof();
-
             // TODO: check build number and send back appropriate packet
             // (assuming WotLK right now, 3.3.5a, build 12340)
-
-            List<byte> data = new List<byte>();
-            data.Add((byte)_currentCommand); // cmd
-            data.Add(0); // error
-            data.AddRange(proof); // server proof
-            data.AddRange(Enumerable.Repeat((byte)0, 4)); //accountFlags
-            data.AddRange(Enumerable.Repeat((byte)0, 4)); //surveyId
-            data.AddRange(Enumerable.Repeat((byte)0, 2)); //unkFlags
-
-            await _clientStream.WriteAsync(data.ToArray(), 0, data.Count);
+            await _writer.PassProofAsync(
+                _authentication.ComputeProof(),
+                0, 0);
         }
 
         public async Task HandleRealmListAsync()
@@ -171,56 +163,8 @@ namespace Mimic.RealmServer
             // 4 empty bytes?
             uint unknown = await _reader.ReadUInt32Async();
 
-            ushort realmCount = 1000;
-
-            List<byte> realms = new List<byte>();
-            realms.AddRange(BitConverter.GetBytes(0)); // unused/unknown
-            realms.AddRange(BitConverter.GetBytes(realmCount)); // number of realms
-            for (int i = 0; i < realmCount; i++)
-            {
-                realms.Add(0x02); // realm type
-                realms.Add(0x00); // lock (0x00 == unlocked)
-                realms.Add(0x40); // realm flags (0x40 == recommended)
-                realms.AddRange(Encoding.UTF8.GetBytes($"Realm {i}")); // name
-                realms.Add(0); // null-terminator
-                realms.AddRange(Encoding.UTF8.GetBytes("127.0.0.1:1234")); // address
-                realms.Add(0); // null-terminator
-                realms.AddRange(BitConverter.GetBytes(0.5f)); // population level
-                realms.Add(0x00); // number of characters
-                realms.Add(0x01); // timezone
-
-                realms.Add(0x2C); // unknown
-            }
-
-            realms.AddRange(BitConverter.GetBytes((ushort)0x0010)); // unused/unknown
-
-            List<byte> data = new List<byte>();
-            data.Add((byte)AuthCommand.RealmList);
-            data.AddRange(BitConverter.GetBytes((ushort)realms.Count));
-            data.AddRange(realms);
-
-            await _clientStream.WriteAsync(data.ToArray(), 0, data.Count);
-        }
-
-        private async Task SendErrorAsync(AuthStatus errorCode)
-        {
-            // TODO: make sure this is a valid packet
-            // The client disconnects when we send this, which is good but not
-            // what we want.
-            byte[] data = {
-                (byte)_currentCommand,
-                (byte)errorCode
-            };
-
-            await _clientStream.WriteAsync(data, 0, 2);
-        }
-
-        private async Task CloseAsync(AuthStatus errorCode)
-        {
-            await SendErrorAsync(errorCode);
-            await Task.Delay(300); // Give the packet some time to be sent
-            _client.Close();
-            _run = false;
+            // TODO: retrieve realm list from external source and provide here
+            await _writer.ServerListAsync();
         }
     }
 }

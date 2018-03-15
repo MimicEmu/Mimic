@@ -1,4 +1,4 @@
-namespace Mimic.Common
+namespace Mimic.RealmServer
 {
     public enum Locale : uint
     {

@@ -1,10 +1,12 @@
 using System;
+using System.Buffers.Binary;
 using System.Numerics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using Mimic.Common;
 using System.Linq;
+using Mimic.Common.Memory;
 
 namespace Mimic.RealmServer
 {
@@ -73,11 +75,11 @@ namespace Mimic.RealmServer
         }
 
         public bool Authenticate(
-            byte[] clientPublicKey,
-            byte[] clientProof)
+            ReadOnlySpan<byte> clientPublicKey,
+            ReadOnlySpan<byte> clientProof)
         {
-            _A = BigIntFromByteArray(clientPublicKey);
-            _M1 = BigIntFromByteArray(clientProof);
+            _A = BigIntFromByteArray(clientPublicKey.ToArray());
+            _M1 = BigIntFromByteArray(clientProof.ToArray());
 
             if (_A.IsZero || (_A % _N).IsZero)
                 return false;
@@ -93,27 +95,22 @@ namespace Mimic.RealmServer
 
             _K = ComputeSessionKey(S);
 
-            var nHash = HashArrays(BigIntToByteArray(_N));
-            var gHash = HashArrays(BigIntToByteArray(_g));
+            Span<byte> ngHash = HashArrays(BigIntToByteArray(_N));
+            ReadOnlySpan<byte> gHash = HashArrays(BigIntToByteArray(_g));
 
-            var ngHashXor = nHash.Zip(gHash, (x, y) => (byte)(x ^ y))
-                .ToArray();
+            MemoryOperations.InPlaceXor(ngHash, gHash);
+
             var iHash = HashArrays(Encoding.UTF8.GetBytes(_I));
 
             var clientProofCheck = HashArrays(
-                ngHashXor, iHash,
+                ngHash.ToArray(), iHash,
                 BigIntToByteArray(_s),
                 BigIntToByteArray(_A),
                 BigIntToByteArray(_B),
                 BigIntToByteArray(_K)
             );
 
-            var diff = clientProof.Length ^ clientProofCheck.Length;
-            diff |= clientProof
-                .Zip(clientProofCheck, (x, y) => x ^ y)
-                .Aggregate((x, y) => x | y);
-
-            return diff == 0;
+            return clientProof.SequenceEqual(clientProofCheck);
         }
 
         public byte[] ComputeProof()

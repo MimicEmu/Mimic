@@ -5,15 +5,24 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
-namespace Mimic.Common
+namespace Mimic.Common.Networking
 {
     public class SocketManager<THandler>
-        where THandler : ISocketHandler, new()
+        where THandler : class, ISocketHandler
     {
         private const int BufferSize = 6144;
 
-        private readonly TcpListener _server;
+        private static readonly ObjectFactory _handlerFactory =
+            ActivatorUtilities.CreateFactory(typeof(THandler),
+                Array.Empty<Type>());
+
+        private readonly ILogger _logger;
+        private readonly IServiceScopeFactory _scopeFactory;
+
+        private TcpListener _server;
         private ConcurrentBag<Task> _clientTasks;
 
         private Task _listenTask;
@@ -21,9 +30,18 @@ namespace Mimic.Common
 
 
         public SocketManager(
-            string address = "0.0.0.0",
-            ushort port = 3724)
+            ILogger<SocketManager<THandler>> logger,
+            IServiceScopeFactory scopeFactory)
         {
+            _logger = logger;
+            _scopeFactory = scopeFactory;
+        }
+
+        public void Setup(string address, int port)
+        {
+            if (_listening)
+                throw new InvalidOperationException(
+                    "Cannot setup when a server is currently listening");
             var listenAddress = IPAddress.Parse(address);
             _server = new TcpListener(listenAddress, (int)port);
         }
@@ -38,8 +56,6 @@ namespace Mimic.Common
             _listening = true;
             _server.Start();
             _listenTask = ListenAsync();
-
-            Debug.WriteLine($"Listening on {_server.LocalEndpoint.ToString()}");
         }
 
         public async Task StopAsync()
@@ -51,6 +67,8 @@ namespace Mimic.Common
 
         private async Task ListenAsync()
         {
+            _logger.LogDebug("Listening on {Address}", _server.LocalEndpoint);
+
             while (_listening)
             {
                 var client = await _server.AcceptTcpClientAsync()
@@ -58,15 +76,21 @@ namespace Mimic.Common
 
                 // TODO: this should be handled safer
 
+                _logger.LogInformation("Client connecting from IP {Address}",
+                    client.Client.RemoteEndPoint);
+
                 _clientTasks.Add(Task.Run(async () =>
                 {
                     try
                     {
-                        await HandleClientAsync(client);
+                        using (client)
+                            await HandleClientAsync(client);
                     }
-                    catch (IOException)
+                    catch (Exception e)
                     {
-                        // client likely disconnected, or a net-split occured
+                        _logger.LogError(
+                            "Client exception thrown ({Type}): {Exception}",
+                            e.GetType().Name, e.Message);
                     }
                 }));
             }
@@ -84,17 +108,25 @@ namespace Mimic.Common
 
         private async Task HandleClientAsync(TcpClient client)
         {
-            var handler = new THandler();
+            using (var scope = _scopeFactory.CreateScope())
+            {
+                var services = scope.ServiceProvider;
 
-            try
-            {
-                await handler.RunAsync(client)
-                    .ConfigureAwait(false);
-            }
-            finally
-            {
-                (handler as IDisposable)?.Dispose();
-                client.Close();
+                var handler = _handlerFactory(services,
+                    Array.Empty<object>()) as THandler;
+
+                handler.SetClient(client);
+
+                try
+                {
+                    await handler.RunAsync()
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    (handler as IDisposable)?.Dispose();
+                    client.Close();
+                }
             }
         }
     }
